@@ -16,6 +16,7 @@ const { prismaMock, txMock } = vi.hoisted(() => {
       update: vi.fn(),
       count: vi.fn(),
     },
+    deliverableMedia: { deleteMany: vi.fn() },
     commissionEvent: { create: vi.fn() },
     commissionDispute: { findFirst: vi.fn() },
     notification: { create: vi.fn() },
@@ -39,6 +40,7 @@ import { AppError } from '@/middlewares';
 
 import {
   DELIVERABLE_MAX_MEDIA,
+  removeDeliverableMedia,
   reviewDeliverable,
   submitDeliverable,
   verifyDeliverableAccess,
@@ -93,6 +95,7 @@ beforeEach(() => {
   txMock.deliverable.count.mockResolvedValue(0);
   // No open dispute unless a test asks for one.
   txMock.commissionDispute.findFirst.mockResolvedValue(null);
+  txMock.deliverableMedia.deleteMany.mockResolvedValue({ count: 1 });
   prismaMock.commission.findUnique.mockResolvedValue(makeCommission());
 });
 
@@ -795,5 +798,97 @@ describe('reviewDeliverable (#823)', () => {
       message: 'This commission has an open dispute; an admin must resolve it first',
     });
     expect(txMock.deliverable.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('removeDeliverableMedia (#104)', () => {
+  const MEDIA_ID = 'media-1';
+  const OTHER_MEDIA_ID = 'media-2';
+
+  beforeEach(() => {
+    txMock.commission.findUnique.mockResolvedValue({
+      id: COMMISSION_ID,
+      artistId: ARTIST_ID,
+    });
+    txMock.deliverable.findUnique.mockResolvedValue({
+      id: DELIVERABLE_ID,
+      commissionId: COMMISSION_ID,
+    });
+    txMock.deliverableMedia.deleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('removes exactly the targeted attachment', async () => {
+    await removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID);
+
+    expect(txMock.deliverableMedia.deleteMany).toHaveBeenCalledWith({
+      where: { deliverableId: DELIVERABLE_ID, mediaId: MEDIA_ID },
+    });
+  });
+
+  it('does not touch unrelated media on the same deliverable', async () => {
+    await removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID);
+
+    const call = txMock.deliverableMedia.deleteMany.mock.calls[0]?.[0];
+    expect(call.where.mediaId).toBe(MEDIA_ID);
+    expect(call.where.mediaId).not.toBe(OTHER_MEDIA_ID);
+  });
+
+  it('does not touch media on other deliverables', async () => {
+    await removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID);
+
+    const call = txMock.deliverableMedia.deleteMany.mock.calls[0]?.[0];
+    expect(call.where.deliverableId).toBe(DELIVERABLE_ID);
+  });
+
+  it('allows an admin to remove an attachment', async () => {
+    await expect(
+      removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, UNRELATED_USER_ID, true),
+    ).resolves.toBeUndefined();
+    expect(txMock.deliverableMedia.deleteMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws FORBIDDEN when a non-artist non-admin calls it', async () => {
+    await expect(
+      removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, CLIENT_ID),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(txMock.deliverableMedia.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('throws NOT_FOUND when the commission does not exist', async () => {
+    txMock.commission.findUnique.mockResolvedValue(null);
+
+    await expect(
+      removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'Commission not found' });
+    expect(txMock.deliverableMedia.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('throws NOT_FOUND when the deliverable is not on this commission', async () => {
+    txMock.deliverable.findUnique.mockResolvedValue({
+      id: DELIVERABLE_ID,
+      commissionId: 'other-commission',
+    });
+
+    await expect(
+      removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(txMock.deliverableMedia.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('throws NOT_FOUND when the deliverable does not exist', async () => {
+    txMock.deliverable.findUnique.mockResolvedValue(null);
+
+    await expect(
+      removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(txMock.deliverableMedia.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('throws NOT_FOUND when the attachment does not exist on this deliverable', async () => {
+    txMock.deliverableMedia.deleteMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      removeDeliverableMedia(COMMISSION_ID, DELIVERABLE_ID, MEDIA_ID, ARTIST_ID),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'Media attachment not found on this deliverable' });
   });
 });

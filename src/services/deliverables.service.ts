@@ -505,3 +505,52 @@ export async function reviewDeliverable(
     };
   });
 }
+
+/**
+ * Removes a single media attachment from a deliverable (#104).
+ *
+ * Uses the composite primary key (deliverableId + mediaId) so the delete is
+ * scoped to exactly one join row — it cannot touch media on any other
+ * deliverable. Throws NOT_FOUND if the attachment does not exist on this
+ * deliverable, and FORBIDDEN if the caller is neither the artist nor an admin.
+ */
+export async function removeDeliverableMedia(
+  commissionId: string,
+  deliverableId: string,
+  mediaId: string,
+  userId: string,
+  isAdmin = false,
+): Promise<void> {
+  assertValidId(commissionId, 'commission identifier');
+  assertValidId(deliverableId, 'deliverable identifier');
+  assertValidId(mediaId, 'media identifier');
+  assertValidId(userId, 'user identifier');
+
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const commission = await tx.commission.findUnique({
+      where: { id: commissionId },
+      select: { artistId: true },
+    });
+    if (commission === null) {
+      throw new AppError('NOT_FOUND', 'Commission not found');
+    }
+    if (!isAdmin && commission.artistId !== userId) {
+      throw new AppError('FORBIDDEN', 'Only the artist on this commission can remove attachments');
+    }
+
+    const deliverable = await tx.deliverable.findUnique({
+      where: { id: deliverableId },
+      select: { commissionId: true },
+    });
+    if (deliverable === null || deliverable.commissionId !== commissionId) {
+      throw new AppError('NOT_FOUND', 'Deliverable not found on this commission');
+    }
+
+    const deleted = await tx.deliverableMedia.deleteMany({
+      where: { deliverableId, mediaId },
+    });
+    if (deleted.count === 0) {
+      throw new AppError('NOT_FOUND', 'Media attachment not found on this deliverable');
+    }
+  });
+}

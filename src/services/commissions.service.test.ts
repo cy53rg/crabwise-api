@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { prismaMock } = vi.hoisted(() => {
@@ -11,6 +12,7 @@ const { prismaMock } = vi.hoisted(() => {
       create: vi.fn(),
       update: vi.fn(),
     },
+    transaction: { findFirst: vi.fn() },
     user: { findMany: vi.fn() },
     notification: { create: vi.fn(), createMany: vi.fn() },
   };
@@ -29,8 +31,12 @@ const { prismaMock } = vi.hoisted(() => {
 });
 
 vi.mock('@/services', () => ({ prisma: prismaMock }));
+vi.mock('@/services/commission-refund.service', () => ({
+  scheduleCommissionRefund: vi.fn(),
+}));
 
 import {
+  cancelCommission,
   createCommission,
   getCommissionDetail,
   listCommissionDisputes,
@@ -76,6 +82,7 @@ beforeEach(() => {
   // No open dispute unless a test asks for one.
   prismaMock.transaction.commissionDispute.findFirst.mockResolvedValue(null);
   prismaMock.transaction.commissionDispute.findUnique.mockResolvedValue(null);
+  prismaMock.transaction.transaction.findFirst.mockResolvedValue(null);
   prismaMock.transaction.user.findMany.mockResolvedValue([{ id: 'admin-1' }]);
   prismaMock.transaction.notification.createMany.mockResolvedValue({ count: 1 });
   prismaMock.commission.findUnique.mockResolvedValue(makeCommission());
@@ -97,7 +104,7 @@ describe('updateCommissionStatus', () => {
     await updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'IN_PROGRESS' });
 
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'ACCEPTED' },
       data: { status: 'IN_PROGRESS' },
     });
   });
@@ -106,7 +113,7 @@ describe('updateCommissionStatus', () => {
     await updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' });
 
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'PENDING' },
       data: { status: 'ACCEPTED' },
     });
   });
@@ -117,7 +124,7 @@ describe('updateCommissionStatus', () => {
     await updateCommissionStatus(COMMISSION_ID, CLIENT_ID, 'USER', { status: 'DISPUTED' });
 
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'DELIVERED' },
       data: { status: 'DISPUTED' },
     });
   });
@@ -184,7 +191,7 @@ describe('updateCommissionStatus', () => {
     await updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'CANCELLED' });
 
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'PENDING' },
       data: { status: 'CANCELLED' },
     });
   });
@@ -208,6 +215,136 @@ describe('updateCommissionStatus', () => {
         actorId: ARTIST_ID,
       },
     });
+  });
+
+  it('allows only one of two concurrent acceptance requests to claim the commission', async () => {
+    let currentStatus = 'PENDING';
+    let readers = 0;
+    let releaseReaders!: () => void;
+    const bothRead = new Promise<void>((resolve) => {
+      releaseReaders = resolve;
+    });
+
+    prismaMock.transaction.commission.findUnique.mockImplementation(async () => {
+      const snapshot = makeCommission(currentStatus);
+      readers += 1;
+      if (readers === 2) {
+        releaseReaders();
+      }
+      await bothRead;
+      return snapshot;
+    });
+
+    prismaMock.transaction.commission.update.mockImplementation(
+      async ({
+        where,
+        data,
+      }: {
+        where: { id: string; status?: string };
+        data: { status: string };
+      }) => {
+        if (where.status !== undefined && where.status !== currentStatus) {
+          throw new Prisma.PrismaClientKnownRequestError('Record to update not found.', {
+            code: 'P2025',
+            clientVersion: '6.19.3',
+          });
+        }
+        currentStatus = data.status;
+        return makeCommission(currentStatus);
+      },
+    );
+
+    const results = await Promise.allSettled([
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' }),
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' }),
+    ]);
+
+    const fulfilled = results.filter(
+      (result): result is PromiseFulfilledResult<{ status: string }> =>
+        result.status === 'fulfilled',
+    );
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+
+    expect(fulfilled).toHaveLength(1);
+    expect(fulfilled[0]?.value.status).toBe('ACCEPTED');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toMatchObject({ code: 'CONFLICT' });
+    expect(prismaMock.transaction.commissionEvent.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects acceptance with CONFLICT when the commission was claimed between read and write', async () => {
+    prismaMock.transaction.commission.update.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Record to update not found.', {
+        code: 'P2025',
+        clientVersion: '6.19.3',
+      }),
+    );
+
+    await expect(
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(prismaMock.transaction.commissionEvent.create).not.toHaveBeenCalled();
+  });
+
+  it('prevents concurrent acceptance and cancellation from both succeeding', async () => {
+    let currentStatus = 'PENDING';
+    let readers = 0;
+    let releaseReaders!: () => void;
+    const bothRead = new Promise<void>((resolve) => {
+      releaseReaders = resolve;
+    });
+
+    prismaMock.transaction.commission.findUnique.mockImplementation(async () => {
+      const snapshot = makeCommission(currentStatus);
+      readers += 1;
+      if (readers === 2) {
+        releaseReaders();
+      }
+      await bothRead;
+      return snapshot;
+    });
+
+    prismaMock.transaction.commission.update.mockImplementation(
+      async ({
+        where,
+        data,
+      }: {
+        where: { id: string; status?: string };
+        data: { status: string };
+      }) => {
+        if (where.status !== undefined && where.status !== currentStatus) {
+          throw new Prisma.PrismaClientKnownRequestError('Record to update not found.', {
+            code: 'P2025',
+            clientVersion: '6.19.3',
+          });
+        }
+        currentStatus = data.status;
+        return makeCommission(currentStatus);
+      },
+    );
+
+    const [acceptResult, cancelResult] = await Promise.allSettled([
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' }),
+      cancelCommission(COMMISSION_ID, CLIENT_ID, { reason: 'Client changed plans' }),
+    ]);
+
+    expect(acceptResult.status).toBe('fulfilled');
+    expect(cancelResult.status).toBe('rejected');
+    if (cancelResult.status === 'rejected') {
+      expect(cancelResult.reason).toMatchObject({ code: 'CONFLICT' });
+    }
+    expect(prismaMock.transaction.commissionEvent.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves unexpected database errors during status transition', async () => {
+    const dbFailure = new Error('connection reset');
+    prismaMock.transaction.commission.update.mockRejectedValue(dbFailure);
+
+    await expect(
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' }),
+    ).rejects.toBe(dbFailure);
   });
 });
 
@@ -537,7 +674,7 @@ describe('raiseCommissionDispute', () => {
 
     expect(dispute.status).toBe('OPEN');
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'DELIVERED' },
       data: { status: 'DISPUTED' },
     });
     expect(prismaMock.transaction.commissionEvent.create).toHaveBeenCalledWith(
@@ -546,6 +683,22 @@ describe('raiseCommissionDispute', () => {
       }),
     );
     expect(prismaMock.transaction.notification.createMany).toHaveBeenCalled();
+  });
+
+  it('rejects with CONFLICT when the commission status changes before dispute creation', async () => {
+    prismaMock.transaction.commission.findUnique.mockResolvedValue(makeCommission('DELIVERED'));
+    prismaMock.transaction.commission.update.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Record to update not found.', {
+        code: 'P2025',
+        clientVersion: '6.19.3',
+      }),
+    );
+
+    await expect(raiseCommissionDispute(COMMISSION_ID, CLIENT_ID, input)).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    expect(prismaMock.transaction.commissionDispute.create).not.toHaveBeenCalled();
+    expect(prismaMock.transaction.commissionEvent.create).not.toHaveBeenCalled();
   });
 
   it('rejects a dispute raised by anyone but the client', async () => {
@@ -595,7 +748,7 @@ describe('resolveCommissionDispute', () => {
 
     expect(result.dispute.status).toBe('RESOLVED');
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'PENDING' },
       data: { status: 'COMPLETED' },
     });
   });
@@ -606,7 +759,7 @@ describe('resolveCommissionDispute', () => {
     });
 
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'PENDING' },
       data: { status: 'CANCELLED' },
     });
   });
@@ -618,9 +771,26 @@ describe('resolveCommissionDispute', () => {
       expect.objectContaining({ data: expect.objectContaining({ status: 'REJECTED' }) }),
     );
     expect(prismaMock.transaction.commission.update).toHaveBeenCalledWith({
-      where: { id: COMMISSION_ID },
+      where: { id: COMMISSION_ID, status: 'PENDING' },
       data: { status: 'DELIVERED' },
     });
+  });
+
+  it('rejects with CONFLICT if another admin resolved the dispute concurrently', async () => {
+    prismaMock.transaction.commissionDispute.update.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Record to update not found.', {
+        code: 'P2025',
+        clientVersion: '6.19.3',
+      }),
+    );
+
+    await expect(
+      resolveCommissionDispute(COMMISSION_ID, 'admin-1', 'ADMIN', {
+        decision: 'RELEASE_TO_ARTIST',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(prismaMock.transaction.commission.update).not.toHaveBeenCalled();
+    expect(prismaMock.transaction.notification.createMany).not.toHaveBeenCalled();
   });
 
   it('notifies both parties of the outcome', async () => {

@@ -33,11 +33,16 @@ vi.mock('@/services', () => ({ prisma: prismaMock }));
 import {
   createCommission,
   getCommissionDetail,
+  isCommissionStatusTransitionAllowed,
   listCommissionDisputes,
   listCommissionsForUser,
+  MAX_COMMISSION_BUDGET,
+  MIN_COMMISSION_BUDGET,
   raiseCommissionDispute,
   resolveCommissionDispute,
   updateCommissionStatus,
+  VALID_COMMISSION_STATUS_TRANSITIONS,
+  validateCommissionBudget,
 } from './commissions.service';
 
 const COMMISSION_ID = 'commission-1';
@@ -364,6 +369,96 @@ describe('createCommission', () => {
     await expect(createCommission(CLIENT_ID, CREATE_INPUT)).rejects.toMatchObject({
       code: 'UNPROCESSABLE_ENTITY',
     });
+  });
+});
+
+describe('validate commission price bounds (#68)', () => {
+  it('defines valid minimum and maximum commission budget bounds', () => {
+    expect(MIN_COMMISSION_BUDGET).toBe(0.01);
+    expect(MAX_COMMISSION_BUDGET).toBe(9999999999.99);
+  });
+
+  it('accepts bounds at service level', () => {
+    expect(() => validateCommissionBudget(MIN_COMMISSION_BUDGET)).not.toThrow();
+    expect(() => validateCommissionBudget(250)).not.toThrow();
+    expect(() => validateCommissionBudget(MAX_COMMISSION_BUDGET)).not.toThrow();
+  });
+
+  it('rejects zero, negative, and out-of-range amounts at service level', async () => {
+    for (const invalidBudget of [0, -1, -100, 0.005, 10000000000, Number.POSITIVE_INFINITY, Number.NaN]) {
+      expect(() => validateCommissionBudget(invalidBudget)).toThrow();
+      await expect(
+        createCommission(CLIENT_ID, { ...CREATE_INPUT, budget: invalidBudget }),
+      ).rejects.toMatchObject({
+        code: 'BAD_REQUEST',
+      });
+    }
+  });
+});
+
+describe('prevent a client from changing commission ownership (#67)', () => {
+  it('ensures creator and commissioner identifiers remain server-controlled', async () => {
+    const maliciousInput = {
+      ...CREATE_INPUT,
+      clientId: 'attacker-client',
+      creatorId: 'attacker-creator',
+      commissionerId: 'attacker-commissioner',
+    } as unknown as typeof CREATE_INPUT;
+
+    await createCommission(CLIENT_ID, maliciousInput);
+
+    const callArgs = prismaMock.transaction.commission.create.mock.calls[0]?.[0];
+    expect(callArgs?.data.clientId).toBe(CLIENT_ID);
+    expect(callArgs?.data.artistId).toBe(ARTIST_ID);
+    expect(callArgs?.data).not.toHaveProperty('creatorId');
+    expect(callArgs?.data).not.toHaveProperty('commissionerId');
+  });
+});
+
+describe('enforce valid commission status transitions (#66)', () => {
+  it('exposes valid transitions via VALID_COMMISSION_STATUS_TRANSITIONS and helper', () => {
+    expect(isCommissionStatusTransitionAllowed('PENDING', 'ACCEPTED')).toBe(true);
+    expect(isCommissionStatusTransitionAllowed('ACCEPTED', 'IN_PROGRESS')).toBe(true);
+    expect(isCommissionStatusTransitionAllowed('IN_PROGRESS', 'DELIVERED')).toBe(true);
+    expect(isCommissionStatusTransitionAllowed('DELIVERED', 'COMPLETED')).toBe(true);
+    expect(isCommissionStatusTransitionAllowed('DELIVERED', 'DISPUTED')).toBe(true);
+
+    // Reject updates that move backward
+    expect(isCommissionStatusTransitionAllowed('ACCEPTED', 'PENDING')).toBe(false);
+    expect(isCommissionStatusTransitionAllowed('IN_PROGRESS', 'ACCEPTED')).toBe(false);
+    expect(isCommissionStatusTransitionAllowed('DELIVERED', 'IN_PROGRESS')).toBe(false);
+    expect(isCommissionStatusTransitionAllowed('COMPLETED', 'DELIVERED')).toBe(false);
+
+    // Reject updates that skip required states
+    expect(isCommissionStatusTransitionAllowed('PENDING', 'IN_PROGRESS')).toBe(false);
+    expect(isCommissionStatusTransitionAllowed('PENDING', 'DELIVERED')).toBe(false);
+    expect(isCommissionStatusTransitionAllowed('PENDING', 'COMPLETED')).toBe(false);
+    expect(isCommissionStatusTransitionAllowed('ACCEPTED', 'DELIVERED')).toBe(false);
+  });
+
+  it('rejects updates that move a commission backward', async () => {
+    prismaMock.transaction.commission.findUnique.mockResolvedValue(makeCommission('ACCEPTED'));
+
+    await expect(
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'PENDING' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    prismaMock.transaction.commission.findUnique.mockResolvedValue(makeCommission('IN_PROGRESS'));
+    await expect(
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'ACCEPTED' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('rejects updates that skip required states', async () => {
+    prismaMock.transaction.commission.findUnique.mockResolvedValue(makeCommission('PENDING'));
+
+    await expect(
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'IN_PROGRESS' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    await expect(
+      updateCommissionStatus(COMMISSION_ID, ARTIST_ID, 'ARTIST', { status: 'COMPLETED' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 });
 

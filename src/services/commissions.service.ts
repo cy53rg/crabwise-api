@@ -24,6 +24,46 @@ export interface CreateCommissionInput {
   readonly deadline: Date;
 }
 
+/** Minimum budget allowed for a commission. */
+export const MIN_COMMISSION_BUDGET = 0.01;
+/** Maximum budget allowed for a commission (Prisma Decimal 12,2 scale limit). */
+export const MAX_COMMISSION_BUDGET = 9999999999.99;
+
+/**
+ * Validates commission price/budget bounds (#68).
+ * Rejects zero, negative, non-finite, and out-of-range amounts at service level.
+ */
+export function validateCommissionBudget(budget: number): void {
+  if (
+    typeof budget !== 'number' ||
+    !Number.isFinite(budget) ||
+    budget <= 0 ||
+    budget < MIN_COMMISSION_BUDGET ||
+    budget > MAX_COMMISSION_BUDGET
+  ) {
+    throw new AppError(
+      'BAD_REQUEST',
+      `Commission budget must be a positive number between ${MIN_COMMISSION_BUDGET} and ${MAX_COMMISSION_BUDGET}`,
+    );
+  }
+}
+
+/**
+ * Freezes the two parties of a commission (#67).
+ * Creator (artist) and commissioner (client) identifiers remain server-controlled:
+ * the commissioner is always the authenticated caller and the artist is verified from DB,
+ * preventing a client from changing commission ownership via request input.
+ */
+function commissionPartiesFor(
+  clientId: string,
+  artistId: string,
+): { readonly clientId: string; readonly artistId: string } {
+  if (clientId === artistId) {
+    throw new AppError('BAD_REQUEST', 'You cannot create a commission for yourself');
+  }
+  return { clientId, artistId };
+}
+
 /**
  * A client requests work from an artist: rejects self-commissions and
  * recipients who aren't artists, then creates the PENDING commission and
@@ -33,12 +73,11 @@ export async function createCommission(
   clientId: string,
   input: CreateCommissionInput,
 ): Promise<Commission> {
-  if (clientId === input.artistId) {
-    throw new AppError('BAD_REQUEST', 'You cannot create a commission for yourself');
-  }
+  validateCommissionBudget(input.budget);
+  const parties = commissionPartiesFor(clientId, input.artistId);
 
   const artist = await prisma.user.findUnique({
-    where: { id: input.artistId },
+    where: { id: parties.artistId },
     select: { id: true, role: true },
   });
   if (artist === null) {
@@ -51,8 +90,8 @@ export async function createCommission(
   return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const commission = await tx.commission.create({
       data: {
-        clientId,
-        artistId: input.artistId,
+        clientId: parties.clientId,
+        artistId: parties.artistId,
         title: input.title,
         description: input.description,
         budget: input.budget,
@@ -64,9 +103,9 @@ export async function createCommission(
 
     await tx.notification.create({
       data: {
-        userId: input.artistId,
+        userId: parties.artistId,
         type: 'COMMISSION_REQUEST',
-        data: { commissionId: commission.id, clientId, title: input.title },
+        data: { commissionId: commission.id, clientId: parties.clientId, title: input.title },
       },
     });
 
@@ -180,6 +219,34 @@ const CANCELLABLE_STATUSES: readonly CommissionStatus[] = ['PENDING', 'ACCEPTED'
 /** Final commission states that can no longer transition or be cancelled (#72). */
 export const FINAL_COMMISSION_STATUSES: readonly CommissionStatus[] = ['COMPLETED', 'CANCELLED'];
 
+/**
+ * Valid commission status transitions map (#66).
+ * Defines allowed next states for each commission status to enforce valid
+ * status transitions and reject updates that move a commission backward
+ * or skip required states.
+ */
+export const VALID_COMMISSION_STATUS_TRANSITIONS: Readonly<
+  Record<CommissionStatus, readonly CommissionStatus[]>
+> = {
+  PENDING: ['ACCEPTED', 'CANCELLED'],
+  ACCEPTED: ['IN_PROGRESS', 'CANCELLED'],
+  IN_PROGRESS: ['DELIVERED', 'CANCELLED'],
+  DELIVERED: ['COMPLETED', 'DISPUTED'],
+  DISPUTED: ['COMPLETED', 'CANCELLED', 'DELIVERED'],
+  COMPLETED: [],
+  CANCELLED: [],
+};
+
+/**
+ * Checks whether moving from `from` to `to` is an allowed commission status transition (#66).
+ */
+export function isCommissionStatusTransitionAllowed(
+  from: CommissionStatus,
+  to: CommissionStatus,
+): boolean {
+  return VALID_COMMISSION_STATUS_TRANSITIONS[from]?.includes(to) ?? false;
+}
+
 function assertTransition(
   commission: Commission,
   userId: string,
@@ -191,6 +258,14 @@ function assertTransition(
 
   if (!isArtist && !isClient) {
     throw new AppError('FORBIDDEN', 'You do not participate in this commission');
+  }
+
+  // Reject transitions that move backward or skip required states (#66)
+  if (!isCommissionStatusTransitionAllowed(commission.status, input.status)) {
+    throw new AppError(
+      'CONFLICT',
+      `Cannot change commission from ${commission.status} to ${input.status}`,
+    );
   }
 
   if (input.status === 'CANCELLED') {

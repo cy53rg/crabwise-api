@@ -297,3 +297,34 @@ describe('conversion rounding rules (#64)', () => {
     expect(roundHalfUp.amount).toBe(0.1234568);
   });
 });
+
+describe('reject non-finite conversion inputs (#65)', () => {
+  it('rejects NaN amount in computeConvertedAmount, convertAmount, and tryConvertAmount', async () => {
+    expect(() => computeConvertedAmount(NaN, 1.5, 'USDC')).toThrowError();
+    await expect(convertAmount(NaN, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+    await expect(tryConvertAmount(NaN, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+  });
+
+  it('rejects positive and negative infinity inputs before calculation', async () => {
+    expect(() => computeConvertedAmount(Infinity, 1.5, 'USDC')).toThrowError();
+    expect(() => computeConvertedAmount(-Infinity, 1.5, 'USDC')).toThrowError();
+
+    await expect(convertAmount(Infinity, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+    await expect(convertAmount(-Infinity, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+
+    await expect(tryConvertAmount(Infinity, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+    await expect(tryConvertAmount(-Infinity, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+  });
+});

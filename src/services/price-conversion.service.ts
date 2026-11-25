@@ -238,6 +238,12 @@ export function computeConvertedAmount(
   rate: number,
   targetAsset: PriceAsset,
 ): number {
+  if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+    throw new AppError('BAD_REQUEST', 'Amount must be a finite number');
+  }
+  if (typeof rate !== 'number' || !Number.isFinite(rate)) {
+    throw new AppError('BAD_REQUEST', 'Rate must be a finite number');
+  }
   const precision = ASSET_PRECISION[targetAsset] ?? 2;
   return new Prisma.Decimal(amount)
     .mul(new Prisma.Decimal(rate))
@@ -256,6 +262,9 @@ export async function convertAmount(
   from: PriceAsset,
   to: PriceAsset,
 ): Promise<ConversionResult> {
+  if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+    throw new AppError('BAD_REQUEST', 'Amount must be a finite number');
+  }
   const rate = await getRate(from, to);
   if (rate === null || !Number.isFinite(rate) || rate <= 0) {
     throw new AppError(
@@ -276,6 +285,9 @@ export async function tryConvertAmount(
   from: PriceAsset,
   to: PriceAsset,
 ): Promise<ConversionResult | null> {
+  if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+    throw new AppError('BAD_REQUEST', 'Amount must be a finite number');
+  }
   const rate = await getRate(from, to);
   if (rate === null || !Number.isFinite(rate) || rate <= 0) {
     return null;

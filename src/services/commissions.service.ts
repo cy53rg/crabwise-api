@@ -1,13 +1,13 @@
-import type {
-  Asset,
-  Commission,
-  CommissionDispute,
-  CommissionDisputeStatus,
-  CommissionStatus,
-  Deliverable,
+import {
   Prisma,
-  Review,
-  Role,
+  type Asset,
+  type Commission,
+  type CommissionDispute,
+  type CommissionDisputeStatus,
+  type CommissionStatus,
+  type Deliverable,
+  type Review,
+  type Role,
 } from '@prisma/client';
 
 import { AppError } from '@/middlewares';
@@ -293,6 +293,40 @@ function assertTransition(
   );
 }
 
+function isConcurrentWriteError(err: unknown): boolean {
+  return (
+    err instanceof Prisma.PrismaClientKnownRequestError &&
+    (err.code === 'P2025' || err.code === 'P2034')
+  );
+}
+
+/**
+ * Transitions a commission's status only if it is still in `expectedStatus`.
+ * Under READ COMMITTED, two concurrent transactions can read the same row
+ * before either writes; pinning `status` in `where` ensures PostgreSQL
+ * re-evaluates the predicate after the winner commits so the loser fails
+ * with P2025 -> CONFLICT instead of claiming the same transition twice.
+ */
+async function transitionCommissionRow(
+  tx: Prisma.TransactionClient,
+  commissionId: string,
+  expectedStatus: CommissionStatus,
+  nextStatus: CommissionStatus,
+  conflictMessage = 'Commission status changed during the transition; reload and retry',
+): Promise<Commission> {
+  try {
+    return await tx.commission.update({
+      where: { id: commissionId, status: expectedStatus },
+      data: { status: nextStatus },
+    });
+  } catch (err: unknown) {
+    if (isConcurrentWriteError(err)) {
+      throw new AppError('CONFLICT', conflictMessage);
+    }
+    throw err;
+  }
+}
+
 export async function updateCommissionStatus(
   commissionId: string,
   userId: string,
@@ -328,6 +362,16 @@ export async function updateCommissionStatus(
       if (actor !== 'client' || input.review === undefined) {
         throw new AppError('BAD_REQUEST', 'A client review is required to complete a commission');
       }
+    }
+
+    const updated = await transitionCommissionRow(
+      tx,
+      commissionId,
+      commission.status,
+      input.status,
+    );
+
+    if (input.status === 'COMPLETED' && input.review !== undefined) {
       await tx.review.create({
         data: {
           commissionId,
@@ -339,11 +383,6 @@ export async function updateCommissionStatus(
         },
       });
     }
-
-    const updated = await tx.commission.update({
-      where: { id: commissionId },
-      data: { status: input.status },
-    });
 
     // Append-only audit trail — the detail endpoint builds its timeline from
     // these rows, so every transition is recorded in the same transaction.
@@ -540,6 +579,8 @@ export async function raiseCommissionDispute(
       throw new AppError('CONFLICT', 'This commission already has a dispute');
     }
 
+    await transitionCommissionRow(tx, commissionId, commission.status, 'DISPUTED');
+
     const dispute = await tx.commissionDispute.create({
       data: {
         commissionId,
@@ -549,8 +590,6 @@ export async function raiseCommissionDispute(
         evidence: input.evidence as Prisma.InputJsonValue | undefined,
       },
     });
-
-    await tx.commission.update({ where: { id: commissionId }, data: { status: 'DISPUTED' } });
 
     await tx.commissionEvent.create({
       data: {
@@ -616,20 +655,30 @@ export async function resolveCommissionDispute(
     }
 
     const outcome = DISPUTE_OUTCOMES[input.decision];
-    const updatedDispute = await tx.commissionDispute.update({
-      where: { commissionId },
-      data: {
-        status: outcome.disputeStatus,
-        resolution: input.resolution,
-        resolvedById: adminId,
-        resolvedAt: new Date(),
-      },
-    });
+    let updatedDispute: CommissionDispute;
+    try {
+      updatedDispute = await tx.commissionDispute.update({
+        where: { commissionId, status: dispute.status },
+        data: {
+          status: outcome.disputeStatus,
+          resolution: input.resolution,
+          resolvedById: adminId,
+          resolvedAt: new Date(),
+        },
+      });
+    } catch (err: unknown) {
+      if (isConcurrentWriteError(err)) {
+        throw new AppError('CONFLICT', 'This dispute has already been resolved');
+      }
+      throw err;
+    }
 
-    const updatedCommission = await tx.commission.update({
-      where: { id: commissionId },
-      data: { status: outcome.commissionStatus },
-    });
+    const updatedCommission = await transitionCommissionRow(
+      tx,
+      commissionId,
+      commission.status,
+      outcome.commissionStatus,
+    );
 
     await tx.commissionEvent.create({
       data: {
@@ -748,10 +797,12 @@ export async function cancelCommission(
         ? { required: false, amount: null, asset: null }
         : { required: true, amount: funding.amount.toFixed(2), asset: funding.asset };
 
-    const cancelled = await tx.commission.update({
-      where: { id: commissionId },
-      data: { status: 'CANCELLED' },
-    });
+    const cancelled = await transitionCommissionRow(
+      tx,
+      commissionId,
+      commission.status,
+      'CANCELLED',
+    );
 
     // The reason goes on the timeline, so the audit trail explains itself.
     await tx.commissionEvent.create({
